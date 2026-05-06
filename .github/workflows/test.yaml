@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Davide Bettio <davide@uninstall.it>
+
+name: Test
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        otp: ['28.0']
+        rebar3: ['3.25.1']
+    defaults:
+      run:
+        working-directory: amqtt_client
+    steps:
+      - uses: actions/checkout@v2
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{matrix.otp}}
+          rebar3-version: ${{matrix.rebar3}}
+      - name: Compile
+        run: rebar3 compile
+      - name: Format check
+        run: rebar3 fmt --check
+      - name: Test
+        run: rebar3 eunit
+      - name: Dialyzer
+        run: rebar3 dialyzer
+
+  examples:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        otp: ['28.0']
+        rebar3: ['3.25.1']
+    steps:
+      - uses: actions/checkout@v2
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{matrix.otp}}
+          rebar3-version: ${{matrix.rebar3}}
+      - name: Start local Mosquitto
+        run: bash .github/scripts/start-mosquitto.sh
+      - name: Route test.mosquitto.org to local broker
+        run: echo "127.0.0.1 test.mosquitto.org" | sudo tee -a /etc/hosts
+      - name: Compile all examples
+        run: |
+          for ex in examples/*/; do
+            (cd "$ex" && rebar3 compile)
+          done
+      - name: Format check all examples
+        run: |
+          for ex in examples/*/; do
+            (cd "$ex" && rebar3 fmt --check)
+          done
+      - name: Dialyzer all examples
+        run: |
+          for ex in examples/*/; do
+            (cd "$ex" && rebar3 dialyzer)
+          done
+      - name: Run mqtt_publish_example
+        working-directory: examples/mqtt_publish_example
+        run: erl -pa _build/default/lib/*/ebin -noshell -eval "case mqtt_publish_example:start() of ok -> halt(0); _ -> halt(1) end."
+      - name: Run mqtt_tls_publish_example
+        working-directory: examples/mqtt_tls_publish_example
+        run: erl -pa _build/default/lib/*/ebin -noshell -eval "case mqtt_tls_publish_example:start() of ok -> halt(0); _ -> halt(1) end."
+      - name: Run mqtt_subscribe_example
+        working-directory: examples/mqtt_subscribe_example
+        run: erl -pa _build/default/lib/*/ebin -noshell -eval "case mqtt_subscribe_example:start() of ok -> halt(0); _ -> halt(1) end."
+
+  e2e-otp:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        otp: ['28.0']
+        rebar3: ['3.25.1']
+    steps:
+      - uses: actions/checkout@v2
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{matrix.otp}}
+          rebar3-version: ${{matrix.rebar3}}
+      - name: Start local Mosquitto
+        run: bash .github/scripts/start-mosquitto.sh
+      - name: Build e2e
+        working-directory: e2e/client_pub_sub_e2e
+        run: rebar3 compile
+      - name: Format check e2e
+        working-directory: e2e/client_pub_sub_e2e
+        run: rebar3 fmt --check
+      - name: Run e2e against local broker (TLS)
+        working-directory: e2e/client_pub_sub_e2e
+        env:
+          AMQTT_E2E_USE_TLS: "true"
+        run: erl -pa _build/default/lib/*/ebin -noshell -eval "case client_pub_sub_e2e:start() of ok -> halt(0); _ -> halt(1) end."
