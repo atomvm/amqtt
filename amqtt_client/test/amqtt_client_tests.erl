@@ -308,6 +308,216 @@ manual_ping_test_() ->
         cleanup(Listener, Client)
     end}.
 
+manual_ping_suppressed_while_watchdog_armed_test_() ->
+    {timeout, ?TEST_TIMEOUT, fun() ->
+        {Listener, Port} = start_mock_broker(),
+        Client = connect_and_handshake(Port, <<"c">>, 1),
+        BrokerSocket = accept(Listener),
+        _ConnectData = recv_packet(BrokerSocket),
+        send_connack(BrokerSocket),
+        ?ASSERT_RECEIVE({mqtt, Client, connack, _}, ?RECV_TIMEOUT),
+
+        %% Auto PINGREQ at ~750 ms arms the pingresp_timer watchdog.
+        PingData = recv_packet(BrokerSocket),
+        ?assertMatch({ok, {pingreq, _}, <<>>}, amqtt_proto:decode(PingData)),
+
+        %% A manual ping/1 while the watchdog is armed must not put more
+        %% bytes on the wire: arm_pingresp_timer/1 refuses to renew, so
+        %% any extra PINGREQ would be redundant.
+        amqtt_client:ping(Client),
+        ?assertEqual({error, timeout}, gen_tcp:recv(BrokerSocket, 0, 300)),
+
+        %% Clear the watchdog so cleanup runs against a healthy client.
+        send_broker(BrokerSocket, <<16#D0, 0>>),
+
+        cleanup(Listener, Client)
+    end}.
+
+no_false_timeout_under_publish_cadence_test_() ->
+    {timeout, ?TEST_TIMEOUT, fun() ->
+        {Listener, Port} = start_mock_broker(),
+        process_flag(trap_exit, true),
+        Client = connect_and_handshake(Port, <<"c">>, 1),
+        BrokerSocket = accept(Listener),
+        _ConnectData = recv_packet(BrokerSocket),
+        send_connack(BrokerSocket),
+        ?ASSERT_RECEIVE({mqtt, Client, connack, _}, ?RECV_TIMEOUT),
+
+        PingData = recv_packet(BrokerSocket),
+        ?assertMatch({ok, {pingreq, _}, <<>>}, amqtt_proto:decode(PingData)),
+        timer:sleep(300),
+
+        PubAsync = async_call(fun() ->
+            amqtt_client:publish(Client, <<"t">>, <<"m">>, 1)
+        end),
+        PubData = recv_packet(BrokerSocket),
+        {ok, {publish, PubInfo}, <<>>} = amqtt_proto:decode(PubData),
+        PacketId = maps:get(packet_id, PubInfo),
+        send_broker(BrokerSocket, amqtt_proto:encode_puback(PacketId)),
+        ?assertEqual({ok, PacketId}, await(PubAsync, 2000)),
+
+        receive
+            {mqtt, Client, error, _} = E ->
+                erlang:error({unexpected_error, E});
+            {'EXIT', Client, _} = X ->
+                erlang:error({unexpected_exit, X})
+        after 1200 ->
+            ok
+        end,
+        ?assert(is_process_alive(Client)),
+        process_flag(trap_exit, false),
+
+        cleanup(Listener, Client)
+    end}.
+
+pingresp_timeout_fires_when_broker_silent_test_() ->
+    {timeout, ?TEST_TIMEOUT, fun() ->
+        {Listener, Port} = start_mock_broker(),
+        process_flag(trap_exit, true),
+        Client = connect_and_handshake(Port, <<"c">>, 1),
+        BrokerSocket = accept(Listener),
+        _ConnectData = recv_packet(BrokerSocket),
+        send_connack(BrokerSocket),
+        ?ASSERT_RECEIVE({mqtt, Client, connack, _}, ?RECV_TIMEOUT),
+
+        PingData = recv_packet(BrokerSocket),
+        ?assertMatch({ok, {pingreq, _}, <<>>}, amqtt_proto:decode(PingData)),
+
+        ?ASSERT_RECEIVE({mqtt, Client, error, #{reason := pingresp_timeout}}, 1500),
+        ?ASSERT_RECEIVE({'EXIT', Client, normal}, 1500),
+        process_flag(trap_exit, false),
+
+        try
+            gen_tcp:close(BrokerSocket)
+        catch
+            _:_ -> ok
+        end,
+        try
+            gen_tcp:close(Listener)
+        catch
+            _:_ -> ok
+        end,
+        ok
+    end}.
+
+inbound_publish_cancels_pingresp_watchdog_test_() ->
+    {timeout, ?TEST_TIMEOUT, fun() ->
+        {Listener, Port} = start_mock_broker(),
+        process_flag(trap_exit, true),
+        Client = connect_and_handshake(Port, <<"c">>, 1),
+        BrokerSocket = accept(Listener),
+        _ConnectData = recv_packet(BrokerSocket),
+        send_connack(BrokerSocket),
+        ?ASSERT_RECEIVE({mqtt, Client, connack, _}, ?RECV_TIMEOUT),
+
+        PingData = recv_packet(BrokerSocket),
+        ?assertMatch({ok, {pingreq, _}, <<>>}, amqtt_proto:decode(PingData)),
+
+        InboundPublish = iolist_to_binary(
+            amqtt_proto:encode_publish(#{
+                topic => <<"t">>,
+                message => <<"hi">>,
+                qos => 0
+            })
+        ),
+        send_broker(BrokerSocket, InboundPublish),
+        ?ASSERT_RECEIVE({mqtt, Client, publish, #{topic := <<"t">>}}, ?RECV_TIMEOUT),
+
+        receive
+            {mqtt, Client, error, _} = E ->
+                erlang:error({unexpected_error, E});
+            {'EXIT', Client, _} = X ->
+                erlang:error({unexpected_exit, X})
+        after 1200 ->
+            ok
+        end,
+        ?assert(is_process_alive(Client)),
+        process_flag(trap_exit, false),
+
+        cleanup(Listener, Client)
+    end}.
+
+owner_without_trap_exit_survives_transport_error_test_() ->
+    {timeout, ?TEST_TIMEOUT, fun() ->
+        {Listener, Port} = start_mock_broker(),
+        Tester = self(),
+        Owner = spawn(fun() ->
+            case
+                amqtt_client:connect(#{
+                    host => "127.0.0.1",
+                    port => Port,
+                    client_id => <<"o">>,
+                    keep_alive_seconds => 0,
+                    owner => self()
+                })
+            of
+                {ok, C} ->
+                    Tester ! {client, C},
+                    owner_forwarding_loop(Tester);
+                Err ->
+                    Tester ! {connect_failed, Err}
+            end
+        end),
+        OwnerRef = erlang:monitor(process, Owner),
+        BrokerSocket = accept(Listener),
+        _ConnectData = recv_packet(BrokerSocket),
+        send_connack(BrokerSocket),
+
+        Client =
+            receive
+                {client, C} -> C;
+                {connect_failed, E} -> erlang:error({connect_failed, E})
+            after 3000 ->
+                erlang:error(no_client_msg)
+            end,
+
+        %% PUBACK with packet_id 0: rejected by the hardened decoder. The
+        %% explicit assertion on the forwarded error reason keeps this
+        %% test from silently turning into a no-op if decoder validation
+        %% ever loosens.
+        send_broker(BrokerSocket, <<16#40, 2, 0, 0>>),
+
+        receive
+            {forwarded, {mqtt, Client, error, #{reason := Reason}}} ->
+                ?assertMatch({protocol_error, _}, Reason)
+        after 1000 ->
+            erlang:error(no_error_event)
+        end,
+
+        timer:sleep(50),
+
+        ?assert(is_process_alive(Owner)),
+        ?assertNot(is_process_alive(Client)),
+
+        Owner ! stop,
+        receive
+            {'DOWN', OwnerRef, process, Owner, _} -> ok
+        after 1000 ->
+            erlang:demonitor(OwnerRef, [flush])
+        end,
+
+        try
+            gen_tcp:close(BrokerSocket)
+        catch
+            _:_ -> ok
+        end,
+        try
+            gen_tcp:close(Listener)
+        catch
+            _:_ -> ok
+        end,
+        ok
+    end}.
+
+owner_forwarding_loop(Tester) ->
+    receive
+        stop ->
+            ok;
+        Msg ->
+            Tester ! {forwarded, Msg},
+            owner_forwarding_loop(Tester)
+    end.
+
 %% -------------------------------------------------------------------
 %% QoS 1
 %% -------------------------------------------------------------------
@@ -829,7 +1039,7 @@ buffer_overflow_stops_with_error_test_() ->
         send_broker(BrokerSocket, <<Header/binary, Garbage/binary>>),
 
         ?ASSERT_RECEIVE({mqtt, Client, error, #{reason := buffer_overflow}}, 3000),
-        ?ASSERT_RECEIVE({'EXIT', Client, {transport_error, buffer_overflow}}, 3000),
+        ?ASSERT_RECEIVE({'EXIT', Client, normal}, 3000),
         process_flag(trap_exit, false),
 
         try
@@ -859,7 +1069,7 @@ protocol_error_stops_connection_test_() ->
         send_broker(BrokerSocket, <<16#40, 2, 0, 0>>),
 
         ?ASSERT_RECEIVE({mqtt, Client, error, #{reason := {protocol_error, _}}}, ?RECV_TIMEOUT),
-        ?ASSERT_RECEIVE({'EXIT', Client, {transport_error, {protocol_error, _}}}, ?RECV_TIMEOUT),
+        ?ASSERT_RECEIVE({'EXIT', Client, normal}, ?RECV_TIMEOUT),
         process_flag(trap_exit, false),
 
         try
