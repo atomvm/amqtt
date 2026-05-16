@@ -196,7 +196,7 @@ Erlang:
 {mqtt, Client, disconnected, #{}}
 
 %% Transport error, protocol error, or other fatal condition. The
-%% client process stops immediately afterwards.
+%% client process stops `normal' immediately afterwards.
 {mqtt, Client, error, #{reason := term()}}
 ```
 
@@ -223,7 +223,7 @@ Elixir:
 {:mqtt, client, :disconnected, %{}}
 
 # Transport error, protocol error, or other fatal condition. The
-# client process stops immediately afterwards.
+# client process stops `:normal` immediately afterwards.
 {:mqtt, client, :error, %{reason: term()}}
 ```
 

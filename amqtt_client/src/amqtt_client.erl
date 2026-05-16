@@ -62,7 +62,9 @@
 %%       connection.</li>
 %%   <li>`{mqtt, Pid, error, #{reason := term()}}' on transport error,
 %%       protocol error, or other fatal condition. The gen_server stops
-%%       immediately afterwards.</li>
+%%       with reason `normal' immediately afterwards: the owner observes
+%%       the failure via this message, so a linked non-trap_exit owner
+%%       survives.</li>
 %% </ul>
 %%
 %% == Manual ACK ==
@@ -76,6 +78,17 @@
 %% telling the broker it's been received: an owner crash between event
 %% delivery and persistence will trigger a broker retransmit on
 %% reconnect.
+%%
+%% == Keep-alive ==
+%%
+%% When `keep_alive_seconds' is non-zero a PINGREQ is sent after
+%% `keep_alive_seconds * 0.75' seconds of outbound silence and arms a
+%% PINGRESP watchdog that fires after `keep_alive_seconds' seconds.
+%% Any complete inbound MQTT packet, not only PINGRESP, clears the
+%% watchdog: inbound PUBLISH, SUBACK, or PUBACK already prove the
+%% broker is responding. The trade-off is that a broker dribbling
+%% non-PINGRESP traffic can mask a dropped PINGRESP indefinitely.
+%% Setting `keep_alive_seconds = 0' disables keep-alive entirely.
 %%
 %% @end
 -module(amqtt_client).
@@ -166,8 +179,9 @@
     owner :: pid() | undefined,
     owner_monitor :: reference() | undefined,
     keep_alive_seconds :: 0..65535 | undefined,
-    ping_timer :: reference() | undefined,
+    keepalive_timer :: reference() | undefined,
     pingresp_timer :: reference() | undefined,
+    last_outbound_ms :: integer() | undefined,
     connected = false :: boolean()
 }).
 
@@ -337,7 +351,11 @@ disconnect(Pid) ->
 %%
 %% The keep-alive timer already pings automatically; this is for
 %% applications that want to probe the link explicitly. Asynchronous:
-%% the PINGRESP is consumed silently by the gen_server.
+%% the PINGRESP is consumed silently by the gen_server. If a PINGREQ
+%% is already in flight the call is a no-op (at most one PINGREQ
+%% outstanding). With `keep_alive_seconds = 0' no PINGRESP watchdog is
+%% armed, so the call is best-effort: a missing PINGRESP is not
+%% reported as a timeout.
 %%
 %% @param Pid client returned by {@link connect/1}.
 %% @end
@@ -488,6 +506,11 @@ handle_cast({publish, Topic, Message, 0, Opts}, State) ->
         {ok, State1} -> {noreply, State1};
         {error, Reason, State1} -> stop_with_error(Reason, State1)
     end;
+handle_cast(ping, #state{pingresp_timer = Ref} = State) when Ref =/= undefined ->
+    %% PINGREQ already in flight: keep the existing watchdog deadline,
+    %% do not emit redundant bytes that arm_pingresp_timer/1 would refuse
+    %% to renew anyway.
+    {noreply, State};
 handle_cast(ping, State) ->
     case send_packet(amqtt_proto:encode_pingreq(), State) of
         {ok, State1} -> {noreply, arm_pingresp_timer(State1)};
@@ -533,13 +556,14 @@ handle_info(
     } = State
 ) ->
     stop_with_error(Reason, State);
-handle_info(send_ping, State) ->
-    case send_packet(amqtt_proto:encode_pingreq(), State#state{ping_timer = undefined}) of
-        {ok, State1} -> {noreply, arm_pingresp_timer(State1)};
-        {error, Reason, State1} -> stop_with_error(Reason, State1)
-    end;
-handle_info(pingresp_timeout, State) ->
+handle_info({timeout, Ref, keepalive_check}, #state{keepalive_timer = Ref} = State) ->
+    handle_keepalive_check(State#state{keepalive_timer = undefined});
+handle_info({timeout, _Stale, keepalive_check}, State) ->
+    {noreply, State};
+handle_info({timeout, Ref, pingresp_timeout}, #state{pingresp_timer = Ref} = State) ->
     stop_with_error(pingresp_timeout, State#state{pingresp_timer = undefined});
+handle_info({timeout, _Stale, pingresp_timeout}, State) ->
+    {noreply, State};
 handle_info({request_timeout, PacketId}, State) ->
     case maps:get(PacketId, State#state.pending, undefined) of
         {_AckType, From, _TRef} ->
@@ -640,8 +664,10 @@ raw_send(Packet, #state{transport = T, connection = C}) ->
 
 send_packet(Packet, State) ->
     case raw_send(Packet, State) of
-        ok -> {ok, restart_ping_timer(State)};
-        {error, Reason} -> {error, Reason, State}
+        ok ->
+            {ok, State#state{last_outbound_ms = erlang:monotonic_time(millisecond)}};
+        {error, Reason} ->
+            {error, Reason, State}
     end.
 
 send_and_pend(Packet, PacketId, AckType, From, State) ->
@@ -659,8 +685,7 @@ stop_with_error(Reason, #state{owner = Owner} = State) ->
     Owner ! {mqtt, self(), error, #{reason => Reason}},
     State1 = reply_pending_with_error(Reason, State),
     close_connection(State1),
-    {stop, {transport_error, Reason},
-        cancel_all_timers(State1#state{connection = undefined, connected = false})}.
+    {stop, normal, cancel_all_timers(State1#state{connection = undefined, connected = false})}.
 
 reply_pending_with_error(Reason, #state{pending = Pending} = State) ->
     maps:foreach(
@@ -697,9 +722,10 @@ alloc_packet_id(#state{next_packet_id = Id, pending = Pending} = State, N) ->
 process_buffer(#state{buffer = Buffer} = State) ->
     case amqtt_proto:decode(Buffer) of
         {ok, {Type, Data}, Rest} ->
-            case handle_packet(Type, Data, State#state{buffer = Rest}) of
-                {ok, State1} -> process_buffer(State1);
-                {stop_normal, State1} -> {stop_normal, State1};
+            State1 = observe_inbound(State#state{buffer = Rest}),
+            case handle_packet(Type, Data, State1) of
+                {ok, State2} -> process_buffer(State2);
+                {stop_normal, State2} -> {stop_normal, State2};
                 {error, _, _} = Err -> Err
             end;
         {error, incomplete} ->
@@ -710,7 +736,7 @@ process_buffer(#state{buffer = Buffer} = State) ->
 
 handle_packet(connack, #{return_code := 0} = Data, #state{owner = Owner} = State) ->
     Owner ! {mqtt, self(), connack, Data},
-    {ok, State#state{connected = true}};
+    {ok, schedule_keepalive_timer(State#state{connected = true})};
 handle_packet(connack, Data, #state{owner = Owner} = State) ->
     %% MQTT 3.1.1 §3.2: a non-zero return code requires the broker to close.
     Owner ! {mqtt, self(), connack, Data},
@@ -827,7 +853,8 @@ handle_packet(suback, #{packet_id := PacketId, return_codes := RCs}, State) ->
 handle_packet(unsuback, #{packet_id := PacketId}, State) ->
     {ok, complete_pending(PacketId, unsuback, ok, State)};
 handle_packet(pingresp, _Data, State) ->
-    {ok, cancel_pingresp_timer(State)};
+    %% pingresp_timer already cleared by observe_inbound.
+    {ok, State};
 handle_packet(_Type, _Data, State) ->
     {ok, State}.
 
@@ -845,35 +872,83 @@ complete_pending(PacketId, ExpectedAckType, Reply, #state{pending = Pending} = S
 %% Internal: Timers
 %% -------------------------------------------------------------------
 
-restart_ping_timer(#state{keep_alive_seconds = 0} = State) ->
-    State;
-restart_ping_timer(State) ->
-    State1 = cancel_ping_timer(State),
-    Interval = State1#state.keep_alive_seconds * 750,
-    Ref = erlang:send_after(Interval, self(), send_ping),
-    State1#state{ping_timer = Ref}.
-
-cancel_ping_timer(#state{ping_timer = undefined} = State) ->
-    State;
-cancel_ping_timer(#state{ping_timer = Ref} = State) ->
+cancel_timer_safe(undefined) ->
+    ok;
+cancel_timer_safe(Ref) ->
     erlang:cancel_timer(Ref),
-    State#state{ping_timer = undefined}.
+    ok.
+
+schedule_keepalive_timer(#state{last_outbound_ms = undefined} = State) ->
+    State;
+schedule_keepalive_timer(#state{keep_alive_seconds = 0} = State) ->
+    State;
+schedule_keepalive_timer(
+    #state{
+        keep_alive_seconds = KA,
+        last_outbound_ms = Last,
+        keepalive_timer = OldRef
+    } = State
+) ->
+    cancel_timer_safe(OldRef),
+    Now = erlang:monotonic_time(millisecond),
+    DueIn = max(0, Last + KA * 750 - Now),
+    Ref = erlang:start_timer(DueIn, self(), keepalive_check),
+    State#state{keepalive_timer = Ref}.
+
+handle_keepalive_check(#state{pingresp_timer = Ref} = State) when Ref =/= undefined ->
+    %% PINGREQ in flight: pingresp_timer adjudicates, do not send another.
+    {noreply, State};
+handle_keepalive_check(#state{keep_alive_seconds = 0} = State) ->
+    {noreply, State};
+handle_keepalive_check(
+    #state{keep_alive_seconds = KA, last_outbound_ms = Last} = State
+) ->
+    Idle = KA * 750,
+    Now = erlang:monotonic_time(millisecond),
+    Elapsed = Now - Last,
+    if
+        Elapsed >= Idle ->
+            send_keepalive_pingreq(State);
+        true ->
+            Ref = erlang:start_timer(Idle - Elapsed, self(), keepalive_check),
+            {noreply, State#state{keepalive_timer = Ref}}
+    end.
+
+send_keepalive_pingreq(State) ->
+    case send_packet(amqtt_proto:encode_pingreq(), State) of
+        {ok, State1} ->
+            {noreply, arm_pingresp_timer(State1)};
+        {error, Reason, State1} ->
+            stop_with_error(Reason, State1)
+    end.
+
+%% Any complete inbound MQTT packet clears the watchdog: PINGRESP has
+%% no privileged status. Called per decoded packet, not per TCP chunk.
+observe_inbound(#state{pingresp_timer = undefined} = State) ->
+    State;
+observe_inbound(State) ->
+    schedule_keepalive_timer(cancel_pingresp_timer(State)).
 
 arm_pingresp_timer(#state{keep_alive_seconds = 0} = State) ->
     State;
-arm_pingresp_timer(#state{pingresp_timer = OldRef, keep_alive_seconds = KA} = State) ->
-    case OldRef of
-        undefined -> ok;
-        _ -> erlang:cancel_timer(OldRef)
-    end,
-    Ref = erlang:send_after(KA * 1000, self(), pingresp_timeout),
+arm_pingresp_timer(#state{pingresp_timer = Ref} = State) when Ref =/= undefined ->
+    %% Do not renew: a dropped PINGRESP must not be hidden by the next PINGREQ.
+    State;
+arm_pingresp_timer(#state{keep_alive_seconds = KA} = State) ->
+    Ref = erlang:start_timer(KA * 1000, self(), pingresp_timeout),
     State#state{pingresp_timer = Ref}.
 
 cancel_pingresp_timer(#state{pingresp_timer = undefined} = State) ->
     State;
 cancel_pingresp_timer(#state{pingresp_timer = Ref} = State) ->
-    erlang:cancel_timer(Ref),
+    cancel_timer_safe(Ref),
     State#state{pingresp_timer = undefined}.
 
+cancel_keepalive_timer(#state{keepalive_timer = undefined} = State) ->
+    State;
+cancel_keepalive_timer(#state{keepalive_timer = Ref} = State) ->
+    cancel_timer_safe(Ref),
+    State#state{keepalive_timer = undefined}.
+
 cancel_all_timers(State) ->
-    cancel_pingresp_timer(cancel_ping_timer(State)).
+    cancel_keepalive_timer(cancel_pingresp_timer(State)).
