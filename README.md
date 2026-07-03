@@ -72,7 +72,7 @@ Elixir:
 
 ```elixir
 {:ok, client} = :amqtt_client.connect(%{
-  host: "broker.example.com",
+  host: ~c"broker.example.com",
   port: 1883,
   client_id: "my_client",
   keep_alive_seconds: 60
@@ -102,7 +102,7 @@ Elixir:
 
 ```elixir
 {:ok, client} = :amqtt_client.connect(%{
-  host: "broker.example.com",
+  host: ~c"broker.example.com",
   port: 8883,
   transport: :ssl,
   ssl_opts: [{:verify, :verify_none}],
