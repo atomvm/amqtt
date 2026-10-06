@@ -564,9 +564,11 @@ handle_info({timeout, Ref, pingresp_timeout}, #state{pingresp_timer = Ref} = Sta
     stop_with_error(pingresp_timeout, State#state{pingresp_timer = undefined});
 handle_info({timeout, _Stale, pingresp_timeout}, State) ->
     {noreply, State};
-handle_info({request_timeout, PacketId}, State) ->
+handle_info({timeout, TRef, {request_timeout, PacketId}}, State) ->
+    %% Matching TRef ignores a timer of a request that already completed,
+    %% even if its packet id has been reused since.
     case maps:get(PacketId, State#state.pending, undefined) of
-        {_AckType, From, _TRef} ->
+        {_AckType, From, TRef} ->
             gen_server:reply(From, {error, timeout}),
             {noreply, State#state{pending = maps:remove(PacketId, State#state.pending)}};
         _ ->
@@ -673,7 +675,7 @@ send_packet(Packet, State) ->
 send_and_pend(Packet, PacketId, AckType, From, State) ->
     case send_packet(Packet, State) of
         {ok, State1} ->
-            TRef = erlang:send_after(?REQUEST_TIMEOUT, self(), {request_timeout, PacketId}),
+            TRef = erlang:start_timer(?REQUEST_TIMEOUT, self(), {request_timeout, PacketId}),
             Pending = maps:put(PacketId, {AckType, From, TRef}, State1#state.pending),
             {noreply, State1#state{pending = Pending}};
         {error, Reason, State1} ->

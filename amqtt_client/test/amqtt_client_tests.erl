@@ -547,6 +547,39 @@ publish_qos1_waits_for_puback_test_() ->
         cleanup(Listener, Client)
     end}.
 
+%% A request timeout whose timer reference is not the pending one (a timer
+%% that fired while it was being cancelled) must not fail the request.
+publish_qos1_ignores_stale_request_timeout_test_() ->
+    {timeout, ?TEST_TIMEOUT, fun() ->
+        {Listener, Port} = start_mock_broker(),
+        Client = connect_and_handshake(Port, <<"c">>),
+        BrokerSocket = accept(Listener),
+        _ConnectData = recv_packet(BrokerSocket),
+        send_connack(BrokerSocket),
+        ?ASSERT_RECEIVE({mqtt, Client, connack, _}, ?RECV_TIMEOUT),
+
+        {Ref, _Pid} =
+            PubAsync = async_call(fun() ->
+                amqtt_client:publish(Client, <<"t">>, <<"m">>, 1)
+            end),
+
+        PubData = recv_packet(BrokerSocket),
+        {ok, {publish, PubInfo}, <<>>} = amqtt_proto:decode(PubData),
+        PacketId = maps:get(packet_id, PubInfo),
+
+        Client ! {timeout, make_ref(), {request_timeout, PacketId}},
+        receive
+            {Ref, Early} -> erlang:error({unexpected_reply, Early})
+        after 200 -> ok
+        end,
+
+        send_broker(BrokerSocket, amqtt_proto:encode_puback(PacketId)),
+
+        ?assertEqual({ok, PacketId}, await(PubAsync, 2000)),
+
+        cleanup(Listener, Client)
+    end}.
+
 receive_publish_qos1_auto_puback_test_() ->
     {timeout, ?TEST_TIMEOUT, fun() ->
         {Listener, Port} = start_mock_broker(),
