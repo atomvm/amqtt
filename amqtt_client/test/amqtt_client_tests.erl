@@ -1085,6 +1085,34 @@ protocol_error_stops_connection_test_() ->
         ok
     end}.
 
+connect_open_failure_does_not_kill_caller_test_() ->
+    %% Regression: init/1 failing to open the transport (connection refused,
+    %% nxdomain) must not propagate an exit signal through the start_link link
+    %% to a non-trap_exit caller, and must not be logged as a crash.
+    {timeout, ?TEST_TIMEOUT, fun() ->
+        {Listener, Port} = start_mock_broker(),
+        ok = gen_tcp:close(Listener),
+
+        Self = self(),
+        Caller = spawn(fun() ->
+            Result = amqtt_client:connect(#{
+                host => "127.0.0.1",
+                port => Port,
+                client_id => <<"open_fail">>,
+                keep_alive_seconds => 0
+            }),
+            Self ! {result, self(), Result},
+            timer:sleep(150)
+        end),
+        Ref = monitor(process, Caller),
+
+        ?ASSERT_RECEIVE(
+            {result, Caller, {error, {connect_error, econnrefused}}}, ?RECV_TIMEOUT
+        ),
+        ?ASSERT_RECEIVE({'DOWN', Ref, process, Caller, normal}, ?RECV_TIMEOUT),
+        ok
+    end}.
+
 connect_send_failure_does_not_kill_caller_test_() ->
     %% Regression: handle_call(send_connect_packet) on send failure must stop
     %% the gen_server with reason 'normal' rather than abnormal, otherwise the

@@ -225,6 +225,7 @@ connect(Opts, GenServerOpts) ->
         end,
     Opts1 = Opts#{
         owner => maps:get(owner, Opts, self()),
+        starter => self(),
         transport_tags => maps:get(transport_tags, Opts, DefaultTags)
     },
     case gen_server:start_link(?MODULE, Opts1, GenServerOpts) of
@@ -252,6 +253,8 @@ connect(Opts, GenServerOpts) ->
                     end,
                     Err
             end;
+        {error, {shutdown, {connect_error, _} = Reason}} ->
+            {error, Reason};
         Error ->
             Error
     end.
@@ -409,7 +412,12 @@ init(Opts) ->
             {ok, State};
         {error, Reason} ->
             erlang:demonitor(OwnerRef, [flush]),
-            {stop, {connect_error, Reason}}
+            %% An unreachable broker is an expected outcome, not a crash: the
+            %% shutdown reason keeps proc_lib from logging a crash report, and
+            %% the unlink keeps the exit from killing a non-trap_exit caller.
+            %% connect/2 unwraps the reason again.
+            unlink(maps:get(starter, Opts)),
+            {stop, {shutdown, {connect_error, Reason}}}
     end.
 
 handle_call(send_connect_packet, _From, #state{pending_connect_opts = Opts} = State) ->
